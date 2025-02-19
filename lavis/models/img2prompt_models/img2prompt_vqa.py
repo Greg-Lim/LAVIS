@@ -22,6 +22,10 @@ from lavis.common.registry import registry
 from lavis.models.base_model import BaseModel
 from lavis.models.blip_models.blip_image_text_matching import compute_gradcam
 
+import numpy as np
+
+import time
+
 open_pos = ["NOUN", "VERB", "ADJ", "ADV", "NUM"]
 
 
@@ -167,86 +171,76 @@ class Img2PromptVQA(BaseModel):
                 - gradcams (torch.Tensor): A tensor of shape (batch_size, H*W)
                 - captions (nested list): A nested list of strings of total length batch_size * num_captions
         """
+
+        # Encode images
         encoder_out = self.image_captioning_model.forward_encoder(samples)
-        captions = [[] for _ in range(encoder_out.size(0))]
+        batch_size, num_tokens, dim = encoder_out.shape  # (batch_size, H*W, feature_dim)
 
-        min_num_captions = 0
+        # Batch sample patches for all captions at once
+        patch_id = (
+            torch.multinomial(
+                samples["gradcams"].to(self.image_captioning_model.device),
+                num_patches * num_captions,  # Sample all patches at once
+                replacement=True,
+            ).reshape(batch_size, num_captions, num_patches)
+            + 1
+        )
 
-        while min_num_captions < num_captions:
-            encoder_out_samples = []
-            for i in range(num_captions):
-                patch_id = (
-                    torch.multinomial(
-                        samples["gradcams"].to(self.image_captioning_model.device),
-                        num_patches,
-                    ).reshape(encoder_out.size(0), -1)
-                    + 1
-                )
-                patch_id = (
-                    patch_id.sort(dim=1)
-                    .values.unsqueeze(-1)
-                    .expand(-1, -1, encoder_out.size(2))
-                )
-                encoder_out_sample = torch.gather(encoder_out, 1, patch_id)
-                encoder_out_samples.append(encoder_out_sample)
+        # Sort patches for each caption and expand for gathering
+        patch_id = patch_id.sort(dim=2).values.unsqueeze(-1).expand(-1, -1, -1, dim)
 
-            stacked = torch.stack(encoder_out_samples, dim=1)
-            image_embeds = torch.flatten(
-                stacked, start_dim=0, end_dim=1
-            )  # (bsz*num_seq, num_patch, dim)
+        # Gather encoder outputs based on sampled patches
+        encoder_out_expanded = encoder_out.unsqueeze(1).expand(-1, num_captions, -1, -1)
+        encoder_out_samples = torch.gather(encoder_out_expanded, 2, patch_id)
 
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-                self.image_captioning_model.device
-            )
-            model_kwargs = {
-                "encoder_hidden_states": image_embeds,
-                "encoder_attention_mask": image_atts,
-            }
+        # Flatten batch for parallel processing
+        image_embeds = encoder_out_samples.reshape(-1, num_patches, dim)
+        image_atts = torch.ones(image_embeds.shape[:-1], dtype=torch.long).to(self.image_captioning_model.device)
 
-            prompt = [self.image_captioning_model.prompt] * image_embeds.size(0)
-            prompt = self.image_captioning_model.tokenizer(
-                prompt, return_tensors="pt"
-            ).to(self.image_captioning_model.device)
-            prompt.input_ids[:, 0] = self.image_captioning_model.tokenizer.bos_token_id
-            prompt.input_ids = prompt.input_ids[:, :-1]
+        # Tokenize prompts for batch processing
+        model_kwargs = {
+            "encoder_hidden_states": image_embeds,
+            "encoder_attention_mask": image_atts,
+        }
+        
+        prompt = [self.image_captioning_model.prompt] * image_embeds.shape[0]
+        prompt = self.image_captioning_model.tokenizer(prompt, return_tensors="pt").to(self.image_captioning_model.device)
+        prompt.input_ids[:, 0] = self.image_captioning_model.tokenizer.bos_token_id
+        prompt.input_ids = prompt.input_ids[:, :-1]
 
-            decoder_out = self.image_captioning_model.text_decoder.generate(
-                input_ids=prompt.input_ids,
-                max_length=cap_max_length,
-                min_length=cap_min_length,
-                do_sample=True,
-                top_p=top_p,
-                top_k=top_k,
-                num_return_sequences=1,
-                eos_token_id=self.image_captioning_model.tokenizer.sep_token_id,
-                pad_token_id=self.image_captioning_model.tokenizer.pad_token_id,
-                repetition_penalty=repetition_penalty,
-                **model_kwargs
-            )
+        # Generate captions in a fully batched way
+        decoder_out = self.image_captioning_model.text_decoder.generate(
+            input_ids=prompt.input_ids,
+            max_length=cap_max_length,
+            min_length=cap_min_length,
+            do_sample=True,
+            top_p=top_p,
+            top_k=top_k,
+            num_return_sequences=1,
+            eos_token_id=self.image_captioning_model.tokenizer.sep_token_id,
+            pad_token_id=self.image_captioning_model.tokenizer.pad_token_id,
+            repetition_penalty=repetition_penalty,
+            **model_kwargs
+        )
 
-            itm_outputs = self.image_question_matching_model.itm_rank(
-                image_embeds, image_atts, encoder_input_ids=decoder_out
-            )  # caption filter
+        # Rank captions using ITM model in a single step
+        itm_outputs = self.image_question_matching_model.itm_rank(
+            image_embeds, image_atts, encoder_input_ids=decoder_out
+        )
 
-            outputs = self.image_captioning_model.tokenizer.batch_decode(
-                decoder_out, skip_special_tokens=True
-            )
+        # Decode captions and reshape to (batch_size, num_captions)
+        outputs = self.image_captioning_model.tokenizer.batch_decode(decoder_out, skip_special_tokens=True)
+        captions = np.array(outputs).reshape(batch_size, num_captions)
 
-            for counter, output in enumerate(outputs):
-                ind = counter // num_captions
-                if len(captions[ind]) < num_captions:
-                    caption = output[len(self.image_captioning_model.prompt) :]
-                    overlap_caption = [1 for caps in captions[ind] if caption in caps]
-                    # print(itm_outputs)
-                    if (
-                        len(overlap_caption) == 0 and itm_outputs[counter] >= 0.5
-                    ):  # image filter
-                        captions[ind].append(caption)
+        # Apply filtering: Remove captions with low ITM scores
+        itm_outputs = itm_outputs.reshape(batch_size, num_captions)
+        captions = [
+            [caption for caption, score in zip(captions[i], itm_outputs[i]) if score >= 0.5]
+            for i in range(len(captions))
+        ]
 
-            min_num_captions = min([len(i) for i in captions])
-
+        # Assign final captions to the samples dictionary
         samples["captions"] = captions
-
         return samples
 
     def answer_extraction(self, caption, num_question_generation=30):
@@ -339,6 +333,7 @@ class Img2PromptVQA(BaseModel):
             )
             outputs_list += questions
             cur_b += true_input_size
+
         questions = outputs_list
         samples["questions"] = questions
         samples["answers"] = answers
@@ -555,6 +550,30 @@ class Img2PromptVQA(BaseModel):
     def from_config(cls, model_config):
         itm_config = model_config.image_question_matching_model
         cap_config = model_config.image_captioning_model
+
+        # itm_config = {
+        #     "arch": "blip_image_text_matching",
+        #     "load_finetuned": True,
+        #     "finetuned": "https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_large_retrieval_coco_train2014.pth",
+        #     "vit_type": "large",
+        #     "vit_grad_ckpt": False,
+        #     "vit_ckpt_layer": 0,
+        #     "image_size": 384,
+        #     "med_config_path": "configs/models/med_large_config.json",
+        #     "embed_dim": 256,
+        # }
+
+        # cap_config = {
+        #     'arch': 'blip_caption',
+        #     'load_finetuned': True,
+        #     'finetuned': 'https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_large_caption_coco_train2014.pth',
+        #     'vit_type': 'large',
+        #     'vit_grad_ckpt': True,
+        #     'vit_ckpt_layer': 5,
+        #     'image_size': 384,
+        #     'med_config_path': 'configs/models/med_large_config.json',
+        #     'prompt': 'a picture of '
+        # }
 
         itm_cls = registry.get_model_class(itm_config.arch)
         cap_cls = registry.get_model_class(cap_config.arch)
