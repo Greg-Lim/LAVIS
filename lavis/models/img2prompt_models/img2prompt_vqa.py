@@ -291,7 +291,7 @@ class Img2PromptVQA(BaseModel):
         contexts_for_question_generation = []
         answers = []
         for ans in real_answers[
-            :num_question_generation
+            :num_question_generation-1
         ]:  # Generate questions for 30 answers with max frequencies.
             contexts_for_question_generation.append(
                 "answer: %s  context: %s." % (ans, cap_use)
