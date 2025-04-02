@@ -297,7 +297,7 @@ class Img2PromptVQA(BaseModel):
         contexts_for_question_generation = []
         answers = []
         for ans in real_answers[
-            :num_question_generation
+            :num_question_generation-1 # keep total generation to 30 for easier batching
         ]:  # Generate questions for 30 answers with max frequencies.
             contexts_for_question_generation.append(
                 "answer: %s  context: %s." % (ans, cap_use)
@@ -325,7 +325,7 @@ class Img2PromptVQA(BaseModel):
         ).to(self.device)
         question_size = inputs.input_ids.shape[0]
         cur_b = 0
-        true_input_size = 10
+        true_input_size = 10 # batch size
         outputs_list = []
         while cur_b < question_size:
             outputs = self.question_generation_model.generate(
